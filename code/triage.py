@@ -1,143 +1,279 @@
+# code/triage.py
+
 import re
-from typing import Dict, List
+from typing import Dict, Optional
 
 
-ESCALATION_KEYWORDS = [
+SUPPORTED_COMPANIES = {"hackerrank", "claude", "visa"}
+
+SENSITIVE_KEYWORDS = {
     "fraud",
     "hacked",
     "stolen card",
     "unauthorized payment",
     "unauthorised payment",
-    "legal",
-    "lawsuit",
-    "billing dispute",
     "account takeover",
-    "refund escalation",
-    "human agent",
+    "lawsuit",
+    "legal",
     "security breach",
+    "refund dispute",
+    "billing dispute",
     "chargeback",
-    "scam",
-    "identity theft",
-]
+    "human agent",
+    "speak to human",
+    "urgent escalation",
+}
 
-
-REQUEST_TYPE_RULES = {
-    "feature_request": [
-        "feature request",
-        "would like",
-        "please add",
-        "new feature",
-        "enhancement",
-        "improve",
+PRODUCT_AREA_KEYWORDS = {
+    "billing": [
+        "billing",
+        "invoice",
+        "payment",
+        "refund",
+        "charged",
+        "subscription",
     ],
-    "bug": [
-        "bug",
-        "error",
-        "broken",
-        "fails",
-        "failure",
-        "issue",
-        "not working",
-        "crash",
+    "authentication": [
+        "login",
+        "password",
+        "authentication",
+        "2fa",
+        "otp",
+        "verification",
     ],
-    "product_issue": [
-        "cannot",
-        "unable",
-        "problem",
-        "question",
-        "support",
-        "help",
+    "events": [
+        "event",
+        "registration",
+        "webinar",
+        "leaderboard",
+    ],
+    "assessments": [
+        "assessment",
+        "challenge",
+        "coding test",
+        "submission",
+    ],
+    "cards": [
+        "card",
+        "visa card",
+        "credit card",
+        "debit card",
+    ],
+    "payments": [
+        "transaction",
+        "payment",
+        "checkout",
+        "declined",
+    ],
+    "account_access": [
+        "account",
+        "locked",
+        "access",
+        "disabled",
+    ],
+    "onboarding": [
+        "setup",
+        "getting started",
+        "onboarding",
     ],
 }
 
 
-def normalize(text: str) -> str:
-    if not isinstance(text, str):
+def normalize_text(text: Optional[str]) -> str:
+    if text is None:
         return ""
 
-    text = text.lower()
+    text = str(text).lower()
+    text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
 
-def classify_request_type(text: str) -> str:
-    text = normalize(text)
+def infer_company(issue: Optional[str], subject: Optional[str] = None):
+    combined = normalize_text(f"{subject or ''} {issue or ''}")
 
-    for request_type, keywords in REQUEST_TYPE_RULES.items():
-        for keyword in keywords:
-            if keyword in text:
-                return request_type
+    company_keywords = {
+        "hackerrank": [
+            "hackerrank",
+            "coding challenge",
+            "assessment",
+            "hrx",
+        ],
+        "claude": [
+            "claude",
+            "anthropic",
+            "claude ai",
+        ],
+        "visa": [
+            "visa",
+            "visa card",
+            "credit card",
+            "debit card",
+            "payment declined",
+        ],
+    }
 
-    if len(text) < 5:
+    matched = []
+
+    for company, keywords in company_keywords.items():
+        if any(keyword in combined for keyword in keywords):
+            matched.append(company)
+
+    if len(matched) == 1:
+        return matched[0]
+
+    return None
+
+
+def classify_request_type(
+    issue: Optional[str],
+    subject: Optional[str] = None,
+) -> str:
+    combined = normalize_text(f"{subject or ''} {issue or ''}")
+
+    if not combined:
         return "invalid"
 
-    return "product_issue"
+    feature_keywords = {
+        "feature request",
+        "please add",
+        "would like",
+        "new feature",
+        "feature suggestion",
+    }
+
+    bug_keywords = {
+        "bug",
+        "broken",
+        "not working",
+        "error",
+        "crash",
+        "fails",
+        "failure",
+    }
+
+    product_keywords = {
+        "how do i",
+        "unable",
+        "issue",
+        "problem",
+        "support",
+        "help",
+        "question",
+    }
+
+    if any(keyword in combined for keyword in feature_keywords):
+        return "feature_request"
+
+    if any(keyword in combined for keyword in bug_keywords):
+        return "bug"
+
+    if any(keyword in combined for keyword in product_keywords):
+        return "product_issue"
+
+    return "invalid"
+
+
+def infer_product_area(
+    issue: Optional[str],
+    subject: Optional[str] = None,
+    retrieval_results: Optional[Dict] = None,
+) -> str:
+    combined = normalize_text(f"{subject or ''} {issue or ''}")
+
+    for area, keywords in PRODUCT_AREA_KEYWORDS.items():
+        if any(keyword in combined for keyword in keywords):
+            return area
+
+    if retrieval_results:
+        results = retrieval_results.get("results", [])
+
+        if results:
+            top_result = results[0]
+
+            retrieval_area = top_result.get("product_area")
+
+            if retrieval_area:
+                return retrieval_area
+
+    return "general"
+
+
+def contains_sensitive_content(
+    issue: Optional[str],
+    subject: Optional[str] = None,
+) -> bool:
+    combined = normalize_text(f"{subject or ''} {issue or ''}")
+
+    return any(keyword in combined for keyword in SENSITIVE_KEYWORDS)
 
 
 def should_escalate(
-    ticket_text: str,
-    company: str,
-    retrieval_results: List[Dict],
-) -> Dict:
-    text = normalize(ticket_text)
+    issue: Optional[str],
+    subject: Optional[str],
+    company: Optional[str],
+    retrieval_results: Dict,
+) -> bool:
+    if contains_sensitive_content(issue, subject):
+        return True
 
-    for keyword in ESCALATION_KEYWORDS:
-        if keyword in text:
-            return {
-                "escalate": True,
-                "reason": f"Sensitive keyword detected: {keyword}",
-            }
+    if company not in SUPPORTED_COMPANIES:
+        return True
 
-    if not company:
-        return {
-            "escalate": True,
-            "reason": "Unable to confidently infer company",
-        }
+    confidence = retrieval_results.get("confidence", "low")
 
-    if not retrieval_results:
-        return {
-            "escalate": True,
-            "reason": "No relevant documents retrieved",
-        }
+    if confidence == "low":
+        return True
 
-    top_score = retrieval_results[0].get("score", 0)
+    results = retrieval_results.get("results", [])
 
-    if top_score < 1.0:
-        return {
-            "escalate": True,
-            "reason": "Retrieval confidence too weak",
-        }
+    if not results:
+        return True
 
-    return {
-        "escalate": False,
-        "reason": "Safe automated reply possible",
-    }
+    return False
 
 
-def infer_product_area(retrieval_results: List[Dict]) -> str:
-    if not retrieval_results:
-        return "general"
+def build_justification(
+    status: str,
+    retrieval_results: Dict,
+    company: Optional[str],
+) -> str:
+    if status == "escalated":
+        confidence = retrieval_results.get("confidence", "low")
 
-    top_doc = retrieval_results[0]
+        if company not in SUPPORTED_COMPANIES:
+            return (
+                "Escalated because company could not be "
+                "confidently inferred."
+            )
 
-    source = top_doc.get("source", "").lower()
+        if confidence == "low":
+            return (
+                "Escalated due to weak retrieval confidence "
+                "or insufficient support evidence."
+            )
 
-    if "billing" in source:
-        return "billing"
+        return "Escalated due to sensitive or high-risk content."
 
-    if "auth" in source or "login" in source:
-        return "authentication"
+    results = retrieval_results.get("results", [])
 
-    if "payment" in source:
-        return "payments"
+    if not results:
+        return "Replied using limited grounded support documentation."
 
-    if "api" in source:
-        return "api"
+    source = results[0].get("source_path", "support corpus")
 
-    company = top_doc.get("company", "").strip()
+    return f"Replied using grounded retrieval evidence from {source}."
 
-    if company:
-        return company
 
-    return "general"
+def generate_fallback_response(status: str) -> str:
+    if status == "escalated":
+        return (
+            "Your request requires additional review by a support "
+            "specialist. The issue has been escalated for further assistance."
+        )
+
+    return (
+        "Based on the available support documentation, we found "
+        "guidance related to your request."
+    )

@@ -1,36 +1,39 @@
+# code/main.py
+
 import os
 import sys
-import traceback
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from dotenv import load_dotenv
-
-from retrieval import RetrievalEngine
+from llm import generate_response
+from retrieval import RetrievalEngine, load_corpus
 from triage import (
+    build_justification,
     classify_request_type,
+    generate_fallback_response,
+    infer_company,
     infer_product_area,
     should_escalate,
 )
-from llm import GeminiResponder
 
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
 
-DATA_DIR = os.path.join(BASE_DIR, "data")
+INPUT_CSV = PROJECT_ROOT / "support_tickets" / "support_tickets.csv"
+OUTPUT_CSV = PROJECT_ROOT / "support_tickets" / "output.csv"
+DATA_DIR = PROJECT_ROOT / "data"
 
-INPUT_CSV = os.path.join(
-    BASE_DIR,
-    "support_tickets",
-    "support_tickets.csv",
-)
 
-OUTPUT_CSV = os.path.join(
-    BASE_DIR,
-    "support_tickets",
-    "output.csv",
-)
+REQUIRED_COLUMNS = [
+    "status",
+    "product_area",
+    "response",
+    "justification",
+    "request_type",
+]
 
 
 def safe_string(value):
@@ -43,176 +46,145 @@ def safe_string(value):
     return str(value).strip()
 
 
-def load_tickets():
-    if not os.path.exists(INPUT_CSV):
-        print(f"[ERROR] Missing CSV: {INPUT_CSV}")
-        return pd.DataFrame()
+def validate_input_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    required_input_columns = {"issue", "subject", "company"}
 
-    try:
-        df = pd.read_csv(INPUT_CSV)
+    missing = required_input_columns - set(df.columns)
 
-        df = df.fillna("")
+    if missing:
+        raise ValueError(
+            f"Missing required input columns: {sorted(missing)}"
+        )
 
-        return df
-
-    except Exception as e:
-        print(f"[ERROR] Failed to load CSV: {e}")
-        return pd.DataFrame()
+    return df.fillna("")
 
 
-def build_ticket_text(row):
-    parts = []
+def process_ticket(row, retrieval_engine: RetrievalEngine):
+    issue = safe_string(row.get("issue"))
+    subject = safe_string(row.get("subject"))
+    provided_company = safe_string(row.get("company")).lower()
 
-    for value in row.values:
-        text = safe_string(value)
+    inferred_company = infer_company(issue, subject)
 
-        if text:
-            parts.append(text)
-
-    return " ".join(parts).strip()
-
-
-def process_ticket(ticket_text, retrieval_engine, llm):
-    request_type = classify_request_type(ticket_text)
-
-    company = retrieval_engine.infer_company(ticket_text)
-
-    retrieval_results = retrieval_engine.retrieve(
-        query=ticket_text,
-        company=company,
-        top_k=5,
+    company = (
+        provided_company
+        if provided_company in {"hackerrank", "claude", "visa"}
+        else inferred_company
     )
 
-    escalation = should_escalate(
-        ticket_text=ticket_text,
+    retrieval_results = retrieval_engine.search(
+        issue=issue,
+        subject=subject,
+        company=company,
+    )
+
+    request_type = classify_request_type(issue, subject)
+
+    product_area = infer_product_area(
+        issue=issue,
+        subject=subject,
+        retrieval_results=retrieval_results,
+    )
+
+    escalate = should_escalate(
+        issue=issue,
+        subject=subject,
         company=company,
         retrieval_results=retrieval_results,
     )
 
-    status = "escalated" if escalation["escalate"] else "replied"
+    status = "escalated" if escalate else "replied"
 
-    product_area = infer_product_area(retrieval_results)
-
-    if status == "escalated":
-        response = (
-            "Your request has been forwarded to a human support specialist for further review."
+    if status == "replied":
+        response = generate_response(
+            issue=issue,
+            subject=subject,
+            retrieval_results=retrieval_results,
+            status=status,
         )
     else:
-        response = llm.generate_response(
-            ticket=ticket_text,
-            context_chunks=retrieval_results,
-        )
+        response = generate_fallback_response(status)
 
-    response = safe_string(response)
-
-    if not response:
-        response = (
-            "Your request has been forwarded to a human support specialist for further review."
-        )
+    justification = build_justification(
+        status=status,
+        retrieval_results=retrieval_results,
+        company=company,
+    )
 
     return {
-        "status": status,
-        "product_area": product_area,
-        "response": response,
-        "justification": escalation["reason"],
-        "request_type": request_type,
+        "status": safe_string(status),
+        "product_area": safe_string(product_area),
+        "response": safe_string(response),
+        "justification": safe_string(justification),
+        "request_type": safe_string(request_type),
     }
 
 
-def ensure_output_directory():
-    output_dir = os.path.dirname(OUTPUT_CSV)
-
-    os.makedirs(output_dir, exist_ok=True)
-
-
 def main():
-    print("[INFO] Starting Phase 1 triage engine")
+    print("=" * 70)
+    print("SUPPORT TRIAGE ENGINE")
+    print("=" * 70)
 
-    load_dotenv()
+    if not INPUT_CSV.exists():
+        print(f"[ERROR] Missing input CSV: {INPUT_CSV}")
+        sys.exit(1)
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    print("[INFO] Loading markdown corpus...")
 
-    retrieval_engine = RetrievalEngine(DATA_DIR)
+    documents = load_corpus(str(DATA_DIR))
 
-    print("[INFO] Loading markdown corpus")
+    print(f"[INFO] Loaded {len(documents)} retrieval chunks")
 
-    retrieval_engine.load_documents()
+    retrieval_engine = RetrievalEngine(documents)
 
-    if not retrieval_engine.documents:
-        print("[WARN] No markdown documents loaded")
+    print("[INFO] Loading support tickets...")
 
-    print(
-        f"[INFO] Loaded {len(retrieval_engine.documents)} document chunks"
-    )
+    try:
+        df = pd.read_csv(INPUT_CSV)
+        df = validate_input_dataframe(df)
 
-    llm = GeminiResponder(api_key)
+    except Exception as error:
+        print(f"[ERROR] Failed reading input CSV: {error}")
+        sys.exit(1)
 
-    tickets_df = load_tickets()
+    output_rows = []
 
-    if tickets_df.empty:
-        print("[WARN] No tickets found")
+    total_rows = len(df)
 
-    results = []
+    for index, row in df.iterrows():
+        print(f"[INFO] Processing ticket {index + 1}/{total_rows}")
 
-    for idx, row in tickets_df.iterrows():
         try:
-            ticket_text = build_ticket_text(row)
+            processed = process_ticket(row, retrieval_engine)
 
-            if not ticket_text:
-                result = {
-                    "status": "escalated",
-                    "product_area": "general",
-                    "response": (
-                        "Your request has been forwarded to a human support specialist for further review."
-                    ),
-                    "justification": "Empty ticket content",
-                    "request_type": "invalid",
-                }
+        except Exception as error:
+            processed = {
+                "status": "escalated",
+                "product_area": "general",
+                "response": (
+                    "The request could not be processed safely and "
+                    "has been escalated for review."
+                ),
+                "justification": (
+                    f"Pipeline fallback triggered due to processing "
+                    f"error: {error}"
+                ),
+                "request_type": "invalid",
+            }
 
-            else:
-                result = process_ticket(
-                    ticket_text=ticket_text,
-                    retrieval_engine=retrieval_engine,
-                    llm=llm,
-                )
+        output_rows.append(processed)
 
-            results.append(result)
+    output_df = pd.DataFrame(output_rows)
 
-            print(
-                f"[INFO] Processed ticket {idx + 1}/{len(tickets_df)}"
-            )
+    for column in REQUIRED_COLUMNS:
+        if column not in output_df.columns:
+            output_df[column] = ""
 
-        except Exception as e:
-            print(f"[ERROR] Ticket processing failed: {e}")
-
-            traceback.print_exc()
-
-            results.append(
-                {
-                    "status": "escalated",
-                    "product_area": "general",
-                    "response": (
-                        "Your request has been forwarded to a human support specialist for further review."
-                    ),
-                    "justification": "Unhandled processing failure",
-                    "request_type": "invalid",
-                }
-            )
-
-    output_df = pd.DataFrame(
-        results,
-        columns=[
-            "status",
-            "product_area",
-            "response",
-            "justification",
-            "request_type",
-        ],
-    )
+    output_df = output_df[REQUIRED_COLUMNS]
 
     output_df = output_df.fillna("")
 
-    ensure_output_directory()
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         output_df.to_csv(
@@ -221,13 +193,15 @@ def main():
             encoding="utf-8",
         )
 
-        print(f"[INFO] Output written to: {OUTPUT_CSV}")
+        print(f"[SUCCESS] Output written to: {OUTPUT_CSV}")
 
-    except Exception as e:
-        print(f"[ERROR] Failed to write output CSV: {e}")
+    except Exception as error:
+        print(f"[ERROR] Failed writing output CSV: {error}")
         sys.exit(1)
 
-    print("[INFO] Phase 1 triage complete")
+    print("=" * 70)
+    print("PIPELINE COMPLETE")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

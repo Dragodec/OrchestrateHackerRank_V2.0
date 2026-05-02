@@ -1,175 +1,349 @@
+# code/retrieval.py
+
 import os
 import re
-from typing import List, Dict
+import uuid
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from rank_bm25 import BM25Okapi
 
 
-def safe_read_file(path: str) -> str:
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read()
-    except Exception:
+SUPPORTED_COMPANIES = {"hackerrank", "claude", "visa"}
+
+MIN_CHUNK_SIZE = 80
+MAX_CHUNK_SIZE = 900
+TOP_K = 5
+MAX_CONTEXT_CHARS = 4000
+
+
+def normalize_text(text: Optional[str]) -> str:
+    if text is None:
         return ""
 
-
-def normalize_text(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-
-    text = text.lower()
+    text = str(text).lower()
+    text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
+
     return text.strip()
 
 
-def tokenize(text: str) -> List[str]:
-    text = normalize_text(text)
+def tokenize(text: Optional[str]) -> List[str]:
+    normalized = normalize_text(text)
 
-    if not text:
+    if not normalized:
         return []
 
-    return re.findall(r"\b\w+\b", text)
+    seen = set()
+    tokens = []
+
+    for token in normalized.split():
+        if token not in seen:
+            seen.add(token)
+            tokens.append(token)
+
+    return tokens
 
 
-def chunk_markdown(content: str) -> List[str]:
-    if not content:
-        return []
+def generate_chunk_id(source_path: str, chunk_text: str) -> str:
+    base = f"{source_path}:{chunk_text[:300].strip()}"
+    return uuid.uuid5(uuid.NAMESPACE_URL, base).hex
 
-    chunks = re.split(r"\n\s*\n", content)
 
-    cleaned = []
+def infer_company_from_path(path: str) -> Optional[str]:
+    lowered = path.lower()
 
-    for chunk in chunks:
-        chunk = chunk.strip()
+    for company in SUPPORTED_COMPANIES:
+        if company in lowered:
+            return company
 
-        if len(chunk) < 20:
+    return None
+
+
+def infer_product_area(path: str, title: str, content: str) -> str:
+    combined = f"{path} {title} {content}".lower()
+
+    product_map = {
+        "billing": ["billing", "invoice", "payment", "subscription"],
+        "authentication": ["login", "authentication", "password", "2fa"],
+        "events": ["event", "webinar", "registration"],
+        "assessments": ["assessment", "challenge", "test"],
+        "cards": ["card", "visa card", "debit", "credit"],
+        "payments": ["payment", "transaction", "refund"],
+        "account_access": ["account", "access", "locked"],
+        "onboarding": ["onboarding", "setup", "getting started"],
+    }
+
+    for area, keywords in product_map.items():
+        if any(keyword in combined for keyword in keywords):
+            return area
+
+    return "general"
+
+
+def safe_read_markdown(file_path: Path) -> str:
+    encodings = ["utf-8", "utf-8-sig", "latin-1"]
+
+    for encoding in encodings:
+        try:
+            with open(file_path, "r", encoding=encoding, errors="ignore") as file:
+                return file.read()
+        except Exception:
             continue
 
-        cleaned.append(chunk)
+    return ""
 
-    return cleaned
+
+def extract_title(content: str, fallback: str) -> str:
+    for line in content.splitlines():
+        stripped = line.strip()
+
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+
+    return fallback
+
+
+def split_markdown_chunks(content: str) -> List[str]:
+    content = content.replace("\r\n", "\n")
+
+    sections = re.split(r"\n(?=#)", content)
+
+    chunks = []
+
+    for section in sections:
+        section = section.strip()
+
+        if not section:
+            continue
+
+        paragraphs = re.split(r"\n\s*\n", section)
+
+        current_chunk = ""
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+
+            if not paragraph:
+                continue
+
+            candidate = f"{current_chunk}\n\n{paragraph}".strip()
+
+            if len(candidate) <= MAX_CHUNK_SIZE:
+                current_chunk = candidate
+            else:
+                if len(current_chunk) >= MIN_CHUNK_SIZE:
+                    chunks.append(current_chunk)
+
+                current_chunk = paragraph
+
+        if len(current_chunk) >= MIN_CHUNK_SIZE:
+            chunks.append(current_chunk)
+
+    return chunks
+
+
+def load_corpus(data_dir: str = "../data") -> List[Dict]:
+    documents = []
+    seen_chunk_ids = set()
+
+    data_path = Path(data_dir)
+
+    if not data_path.exists():
+        print("[WARN] Data directory missing")
+        return []
+
+    markdown_files = list(data_path.rglob("*.md"))
+
+    for file_path in markdown_files:
+        try:
+            raw_content = safe_read_markdown(file_path)
+
+            if not raw_content.strip():
+                continue
+
+            title = extract_title(raw_content, file_path.stem)
+
+            company = infer_company_from_path(str(file_path))
+
+            if company not in SUPPORTED_COMPANIES:
+                continue
+
+            chunks = split_markdown_chunks(raw_content)
+
+            for chunk in chunks:
+                cleaned_chunk = chunk.strip()
+
+                if len(cleaned_chunk) < MIN_CHUNK_SIZE:
+                    continue
+
+                chunk_id = generate_chunk_id(str(file_path), cleaned_chunk)
+
+                if chunk_id in seen_chunk_ids:
+                    continue
+
+                seen_chunk_ids.add(chunk_id)
+
+                document = {
+                    "chunk_id": chunk_id,
+                    "company": company,
+                    "source_path": str(file_path),
+                    "title": title,
+                    "product_area": infer_product_area(
+                        str(file_path),
+                        title,
+                        cleaned_chunk,
+                    ),
+                    "content": cleaned_chunk,
+                }
+
+                documents.append(document)
+
+        except Exception as error:
+            print(f"[WARN] Failed loading {file_path}: {error}")
+
+    return documents
 
 
 class RetrievalEngine:
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        self.documents = []
-        self.tokenized_docs = []
-        self.bm25 = None
+    def __init__(self, documents: List[Dict]):
+        self.documents = documents or []
 
-    def load_documents(self):
-        seen = set()
-        doc_id = 0
+        self.tokenized_corpus = []
 
-        if not os.path.exists(self.data_dir):
-            print(f"[WARN] Data directory missing: {self.data_dir}")
-            return
+        for document in self.documents:
+            tokens = tokenize(
+                f"{document.get('title', '')} {document.get('content', '')}"
+            )
 
-        for root, _, files in os.walk(self.data_dir):
-            for file_name in files:
-                if not file_name.lower().endswith(".md"):
-                    continue
+            self.tokenized_corpus.append(tokens if tokens else ["empty"])
 
-                path = os.path.join(root, file_name)
+        self.bm25 = (
+            BM25Okapi(self.tokenized_corpus)
+            if self.tokenized_corpus
+            else None
+        )
 
-                content = safe_read_file(path)
+    def search(
+        self,
+        issue: Optional[str],
+        subject: Optional[str] = None,
+        company: Optional[str] = None,
+        top_k: int = TOP_K,
+    ) -> Dict:
+        if not self.documents or self.bm25 is None:
+            return {
+                "results": [],
+                "confidence": "low",
+            }
 
-                if not content.strip():
-                    continue
+        query = normalize_text(f"{subject or ''} {issue or ''}")
 
-                company = os.path.basename(root).strip().lower()
-
-                chunks = chunk_markdown(content)
-
-                for chunk in chunks:
-                    normalized = normalize_text(chunk)
-
-                    if not normalized:
-                        continue
-
-                    dedupe_key = f"{path}:{normalized}"
-
-                    if dedupe_key in seen:
-                        continue
-
-                    seen.add(dedupe_key)
-
-                    tokens = tokenize(chunk)
-
-                    if not tokens:
-                        continue
-
-                    self.documents.append(
-                        {
-                            "id": doc_id,
-                            "company": company,
-                            "source": path,
-                            "text": chunk,
-                        }
-                    )
-
-                    self.tokenized_docs.append(tokens)
-
-                    doc_id += 1
-
-        if self.tokenized_docs:
-            self.bm25 = BM25Okapi(self.tokenized_docs)
-
-    def infer_company(self, ticket_text: str) -> str:
-        text = normalize_text(ticket_text)
-
-        possible_companies = set()
-
-        for doc in self.documents:
-            company = doc.get("company", "").strip()
-
-            if company and company in text:
-                possible_companies.add(company)
-
-        if len(possible_companies) == 1:
-            return list(possible_companies)[0]
-
-        return ""
-
-    def retrieve(self, query: str, company: str, top_k: int = 5) -> List[Dict]:
-        if not self.bm25:
-            return []
+        if not query:
+            return {
+                "results": [],
+                "confidence": "low",
+            }
 
         query_tokens = tokenize(query)
 
         if not query_tokens:
-            return []
+            return {
+                "results": [],
+                "confidence": "low",
+            }
 
-        scores = self.bm25.get_scores(query_tokens)
+        candidate_docs = self.documents
 
-        results = []
+        if company in SUPPORTED_COMPANIES:
+            candidate_docs = [
+                doc
+                for doc in self.documents
+                if doc["company"] == company
+            ]
 
-        for idx, score in enumerate(scores):
-            if idx >= len(self.documents):
+        if not candidate_docs:
+            return {
+                "results": [],
+                "confidence": "low",
+            }
+
+        candidate_indices = [
+            self.documents.index(doc)
+            for doc in candidate_docs
+        ]
+
+        bm25_scores = self.bm25.get_scores(query_tokens)
+
+        scored_results = []
+
+        for index in candidate_indices:
+            document = self.documents[index]
+            score = float(bm25_scores[index])
+
+            title = normalize_text(document.get("title", ""))
+
+            title_tokens = tokenize(title)
+
+            overlap = len(set(query_tokens) & set(title_tokens))
+
+            score += overlap * 2.0
+
+            if company and document["company"] == company:
+                score += 1.5
+
+            if query in normalize_text(document["content"]):
+                score += 3.0
+
+            scored_results.append((score, document))
+
+        scored_results.sort(key=lambda item: item[0], reverse=True)
+
+        selected = []
+        seen_chunks = set()
+        total_chars = 0
+
+        for score, document in scored_results[: top_k * 2]:
+            content = document["content"]
+
+            normalized = normalize_text(content)
+
+            if normalized in seen_chunks:
                 continue
 
-            doc = self.documents[idx]
+            if total_chars + len(content) > MAX_CONTEXT_CHARS:
+                break
 
-            if company and doc["company"] != company:
-                continue
+            seen_chunks.add(normalized)
 
-            results.append(
+            total_chars += len(content)
+
+            selected.append(
                 {
-                    "score": float(score),
-                    "company": doc["company"],
-                    "source": doc["source"],
-                    "text": doc["text"],
+                    "score": round(score, 4),
+                    "chunk_id": document["chunk_id"],
+                    "company": document["company"],
+                    "product_area": document["product_area"],
+                    "source_path": document["source_path"],
+                    "title": document["title"],
+                    "content": document["content"],
                 }
             )
 
-        results.sort(key=lambda x: x["score"], reverse=True)
+            if len(selected) >= top_k:
+                break
 
-        filtered = []
+        confidence = "low"
 
-        for item in results:
-            if item["score"] <= 0:
-                continue
+        if selected:
+            top_score = selected[0]["score"]
 
-            filtered.append(item)
+            if top_score >= 10:
+                confidence = "high"
+            elif top_score >= 4:
+                confidence = "medium"
 
-        return filtered[:top_k]
+        return {
+            "results": selected,
+            "confidence": confidence,
+        }
