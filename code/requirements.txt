@@ -1,0 +1,5 @@
+google-genai==1.16.1
+rank-bm25==0.2.2
+python-dotenv==1.0.1
+pandas==2.2.3
+numpy==2.2.5
