@@ -1,20 +1,16 @@
-# code/retrieval.py
-
-import os
 import re
-import uuid
-from pathlib import Path
+from collections import Counter
 from typing import Dict, List, Optional
 
 from rank_bm25 import BM25Okapi
 
+from corpus import load_corpus
+
 
 SUPPORTED_COMPANIES = {"hackerrank", "claude", "visa"}
 
-MIN_CHUNK_SIZE = 80
-MAX_CHUNK_SIZE = 900
 TOP_K = 5
-MAX_CONTEXT_CHARS = 4000
+MAX_CONTEXT_CHARS = 3500
 
 
 def normalize_text(text: Optional[str]) -> str:
@@ -34,175 +30,11 @@ def tokenize(text: Optional[str]) -> List[str]:
     if not normalized:
         return []
 
-    seen = set()
-    tokens = []
-
-    for token in normalized.split():
-        if token not in seen:
-            seen.add(token)
-            tokens.append(token)
-
-    return tokens
+    return normalized.split()
 
 
-def generate_chunk_id(source_path: str, chunk_text: str) -> str:
-    base = f"{source_path}:{chunk_text[:300].strip()}"
-    return uuid.uuid5(uuid.NAMESPACE_URL, base).hex
-
-
-def infer_company_from_path(path: str) -> Optional[str]:
-    lowered = path.lower()
-
-    for company in SUPPORTED_COMPANIES:
-        if company in lowered:
-            return company
-
-    return None
-
-
-def infer_product_area(path: str, title: str, content: str) -> str:
-    combined = f"{path} {title} {content}".lower()
-
-    product_map = {
-        "billing": ["billing", "invoice", "payment", "subscription"],
-        "authentication": ["login", "authentication", "password", "2fa"],
-        "events": ["event", "webinar", "registration"],
-        "assessments": ["assessment", "challenge", "test"],
-        "cards": ["card", "visa card", "debit", "credit"],
-        "payments": ["payment", "transaction", "refund"],
-        "account_access": ["account", "access", "locked"],
-        "onboarding": ["onboarding", "setup", "getting started"],
-    }
-
-    for area, keywords in product_map.items():
-        if any(keyword in combined for keyword in keywords):
-            return area
-
-    return "general"
-
-
-def safe_read_markdown(file_path: Path) -> str:
-    encodings = ["utf-8", "utf-8-sig", "latin-1"]
-
-    for encoding in encodings:
-        try:
-            with open(file_path, "r", encoding=encoding, errors="ignore") as file:
-                return file.read()
-        except Exception:
-            continue
-
-    return ""
-
-
-def extract_title(content: str, fallback: str) -> str:
-    for line in content.splitlines():
-        stripped = line.strip()
-
-        if stripped.startswith("#"):
-            return stripped.lstrip("#").strip()
-
-    return fallback
-
-
-def split_markdown_chunks(content: str) -> List[str]:
-    content = content.replace("\r\n", "\n")
-
-    sections = re.split(r"\n(?=#)", content)
-
-    chunks = []
-
-    for section in sections:
-        section = section.strip()
-
-        if not section:
-            continue
-
-        paragraphs = re.split(r"\n\s*\n", section)
-
-        current_chunk = ""
-
-        for paragraph in paragraphs:
-            paragraph = paragraph.strip()
-
-            if not paragraph:
-                continue
-
-            candidate = f"{current_chunk}\n\n{paragraph}".strip()
-
-            if len(candidate) <= MAX_CHUNK_SIZE:
-                current_chunk = candidate
-            else:
-                if len(current_chunk) >= MIN_CHUNK_SIZE:
-                    chunks.append(current_chunk)
-
-                current_chunk = paragraph
-
-        if len(current_chunk) >= MIN_CHUNK_SIZE:
-            chunks.append(current_chunk)
-
-    return chunks
-
-
-def load_corpus(data_dir: str = "../data") -> List[Dict]:
-    documents = []
-    seen_chunk_ids = set()
-
-    data_path = Path(data_dir)
-
-    if not data_path.exists():
-        print("[WARN] Data directory missing")
-        return []
-
-    markdown_files = list(data_path.rglob("*.md"))
-
-    for file_path in markdown_files:
-        try:
-            raw_content = safe_read_markdown(file_path)
-
-            if not raw_content.strip():
-                continue
-
-            title = extract_title(raw_content, file_path.stem)
-
-            company = infer_company_from_path(str(file_path))
-
-            if company not in SUPPORTED_COMPANIES:
-                continue
-
-            chunks = split_markdown_chunks(raw_content)
-
-            for chunk in chunks:
-                cleaned_chunk = chunk.strip()
-
-                if len(cleaned_chunk) < MIN_CHUNK_SIZE:
-                    continue
-
-                chunk_id = generate_chunk_id(str(file_path), cleaned_chunk)
-
-                if chunk_id in seen_chunk_ids:
-                    continue
-
-                seen_chunk_ids.add(chunk_id)
-
-                document = {
-                    "chunk_id": chunk_id,
-                    "company": company,
-                    "source_path": str(file_path),
-                    "title": title,
-                    "product_area": infer_product_area(
-                        str(file_path),
-                        title,
-                        cleaned_chunk,
-                    ),
-                    "content": cleaned_chunk,
-                }
-
-                documents.append(document)
-
-        except Exception as error:
-            print(f"[WARN] Failed loading {file_path}: {error}")
-
-    return documents
+def keyword_overlap(query_tokens, doc_tokens):
+    return len(set(query_tokens) & set(doc_tokens))
 
 
 class RetrievalEngine:
@@ -212,17 +44,51 @@ class RetrievalEngine:
         self.tokenized_corpus = []
 
         for document in self.documents:
-            tokens = tokenize(
-                f"{document.get('title', '')} {document.get('content', '')}"
+            combined = (
+                f"{document.get('title', '')} "
+                f"{document.get('content', '')}"
             )
 
-            self.tokenized_corpus.append(tokens if tokens else ["empty"])
+            tokens = tokenize(combined)
+
+            self.tokenized_corpus.append(
+                tokens if tokens else ["empty"]
+            )
 
         self.bm25 = (
             BM25Okapi(self.tokenized_corpus)
             if self.tokenized_corpus
             else None
         )
+
+    def compute_confidence(
+        self,
+        selected: List[Dict],
+    ) -> str:
+        if not selected:
+            return "low"
+
+        top_score = selected[0]["score"]
+
+        if len(selected) == 1:
+            gap = top_score
+        else:
+            gap = top_score - selected[1]["score"]
+
+        overlaps = [
+            item.get("overlap", 0)
+            for item in selected
+        ]
+
+        avg_overlap = sum(overlaps) / max(len(overlaps), 1)
+
+        if top_score >= 12 and gap >= 3 and avg_overlap >= 3:
+            return "high"
+
+        if top_score >= 5 and avg_overlap >= 1:
+            return "medium"
+
+        return "low"
 
     def search(
         self,
@@ -237,13 +103,9 @@ class RetrievalEngine:
                 "confidence": "low",
             }
 
-        query = normalize_text(f"{subject or ''} {issue or ''}")
-
-        if not query:
-            return {
-                "results": [],
-                "confidence": "low",
-            }
+        query = normalize_text(
+            f"{subject or ''} {issue or ''}"
+        )
 
         query_tokens = tokenize(query)
 
@@ -253,74 +115,123 @@ class RetrievalEngine:
                 "confidence": "low",
             }
 
-        candidate_docs = self.documents
+        candidate_indices = []
 
-        if company in SUPPORTED_COMPANIES:
-            candidate_docs = [
-                doc
-                for doc in self.documents
-                if doc["company"] == company
-            ]
+        for index, doc in enumerate(self.documents):
+            if (
+                company in SUPPORTED_COMPANIES
+                and doc["company"] != company
+            ):
+                continue
 
-        if not candidate_docs:
+            candidate_indices.append(index)
+
+        if not candidate_indices:
             return {
                 "results": [],
                 "confidence": "low",
             }
 
-        candidate_indices = [
-            self.documents.index(doc)
-            for doc in candidate_docs
-        ]
-
         bm25_scores = self.bm25.get_scores(query_tokens)
 
-        scored_results = []
+        scored = []
+
+        query_counter = Counter(query_tokens)
 
         for index in candidate_indices:
             document = self.documents[index]
-            score = float(bm25_scores[index])
 
-            title = normalize_text(document.get("title", ""))
+            base_score = float(bm25_scores[index])
 
-            title_tokens = tokenize(title)
+            title_tokens = tokenize(document["title"])
+            content_tokens = tokenize(document["content"])
 
-            overlap = len(set(query_tokens) & set(title_tokens))
+            overlap = keyword_overlap(
+                query_tokens,
+                content_tokens,
+            )
 
-            score += overlap * 2.0
+            title_overlap = keyword_overlap(
+                query_tokens,
+                title_tokens,
+            )
 
-            if company and document["company"] == company:
-                score += 1.5
+            exact_phrase = (
+                1
+                if query in normalize_text(
+                    document["content"]
+                )
+                else 0
+            )
 
-            if query in normalize_text(document["content"]):
-                score += 3.0
+            density = 0
 
-            scored_results.append((score, document))
+            if content_tokens:
+                density = overlap / len(content_tokens)
 
-        scored_results.sort(key=lambda item: item[0], reverse=True)
+            score = base_score
+
+            score += overlap * 1.5
+            score += title_overlap * 3.0
+            score += exact_phrase * 4.0
+            score += density * 10
+
+            repeated_signal = sum(
+                count
+                for token, count in query_counter.items()
+                if token in content_tokens
+            )
+
+            score += repeated_signal * 0.2
+
+            scored.append(
+                {
+                    "score": round(score, 4),
+                    "overlap": overlap,
+                    "document": document,
+                }
+            )
+
+        scored.sort(
+            key=lambda item: item["score"],
+            reverse=True,
+        )
 
         selected = []
-        seen_chunks = set()
+
+        seen_content = set()
+
         total_chars = 0
 
-        for score, document in scored_results[: top_k * 2]:
-            content = document["content"]
+        for item in scored:
+            document = item["document"]
 
-            normalized = normalize_text(content)
+            content = normalize_text(
+                document["content"]
+            )
 
-            if normalized in seen_chunks:
+            if content in seen_content:
                 continue
 
-            if total_chars + len(content) > MAX_CONTEXT_CHARS:
+            if total_chars >= MAX_CONTEXT_CHARS:
                 break
 
-            seen_chunks.add(normalized)
+            projected = (
+                total_chars
+                + len(document["content"])
+            )
 
-            total_chars += len(content)
+            if projected > MAX_CONTEXT_CHARS:
+                continue
+
+            seen_content.add(content)
+
+            total_chars += len(document["content"])
 
             selected.append(
                 {
-                    "score": round(score, 4),
+                    "score": item["score"],
+                    "overlap": item["overlap"],
                     "chunk_id": document["chunk_id"],
                     "company": document["company"],
                     "product_area": document["product_area"],
@@ -333,15 +244,7 @@ class RetrievalEngine:
             if len(selected) >= top_k:
                 break
 
-        confidence = "low"
-
-        if selected:
-            top_score = selected[0]["score"]
-
-            if top_score >= 10:
-                confidence = "high"
-            elif top_score >= 4:
-                confidence = "medium"
+        confidence = self.compute_confidence(selected)
 
         return {
             "results": selected,

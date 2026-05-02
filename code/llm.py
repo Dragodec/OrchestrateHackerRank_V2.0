@@ -1,5 +1,3 @@
-# code/llm.py
-
 import os
 import time
 from typing import Dict, List
@@ -24,41 +22,47 @@ SYSTEM_PROMPT = """
 You are a grounded support triage assistant.
 
 STRICT RULES:
-- Use ONLY the provided support context.
-- NEVER invent policies.
-- NEVER invent troubleshooting steps.
-- NEVER use outside knowledge.
-- NEVER assume unsupported details.
-- Keep responses concise and user-safe.
-- If context is insufficient, say the issue requires escalation.
+- Use ONLY provided context
+- NEVER invent policies
+- NEVER use outside knowledge
+- NEVER hallucinate troubleshooting
+- Keep responses concise
+- If evidence is weak, say escalation is needed
 """
 
 
 def build_context(results: List[Dict]) -> str:
-    if not results:
-        return ""
+    blocks = []
 
-    context_parts = []
+    seen = set()
 
     for result in results:
         title = result.get("title", "").strip()
         content = result.get("content", "").strip()
 
-        if not content:
+        normalized = content.lower()
+
+        if (
+            not content
+            or normalized in seen
+        ):
             continue
 
-        block = f"TITLE: {title}\nCONTENT:\n{content}"
+        seen.add(normalized)
 
-        context_parts.append(block)
+        compact = (
+            f"[{title}]\n{content}"
+        )
 
-    return "\n\n---\n\n".join(context_parts)
+        blocks.append(compact)
+
+    return "\n\n".join(blocks)
 
 
 def fallback_response() -> str:
     return (
-        "We could not confidently generate a grounded response from the "
-        "available support documentation. Your request may require "
-        "additional review."
+        "We could not confidently generate a grounded "
+        "response from the available support documentation."
     )
 
 
@@ -70,8 +74,8 @@ def generate_response(
 ) -> str:
     if status == "escalated":
         return (
-            "Your request requires additional review by a support "
-            "specialist and has been escalated safely."
+            "Your request requires additional review "
+            "by a support specialist."
         )
 
     results = retrieval_results.get("results", [])
@@ -94,34 +98,31 @@ def generate_response(
     except Exception:
         return fallback_response()
 
-    user_prompt = f"""
-SUPPORT ISSUE:
-Subject: {subject or ''}
+    prompt = f"""
+ISSUE SUBJECT:
+{subject}
 
-Issue:
-{issue or ''}
+ISSUE:
+{issue}
 
-GROUNDING CONTEXT:
+SUPPORT CONTEXT:
 {context}
 
 TASK:
-Generate a concise support response using ONLY the provided grounding context.
+Generate a concise grounded support reply.
 """
 
     for attempt in range(MAX_RETRIES):
         try:
             response = client.models.generate_content(
                 model=MODEL_NAME,
-                contents=f"{SYSTEM_PROMPT}\n\n{user_prompt}",
+                contents=f"{SYSTEM_PROMPT}\n\n{prompt}",
             )
 
-            text = ""
+            text = getattr(response, "text", "")
 
-            if hasattr(response, "text") and response.text:
-                text = response.text.strip()
-
-            if text:
-                return text
+            if text and text.strip():
+                return text.strip()
 
         except Exception:
             if attempt < MAX_RETRIES - 1:

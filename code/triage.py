@@ -1,5 +1,3 @@
-# code/triage.py
-
 import re
 from typing import Dict, Optional
 
@@ -11,71 +9,48 @@ SENSITIVE_KEYWORDS = {
     "hacked",
     "stolen card",
     "unauthorized payment",
-    "unauthorised payment",
     "account takeover",
     "lawsuit",
     "legal",
     "security breach",
     "refund dispute",
-    "billing dispute",
     "chargeback",
-    "human agent",
-    "speak to human",
-    "urgent escalation",
 }
 
+
 PRODUCT_AREA_KEYWORDS = {
-    "billing": [
-        "billing",
-        "invoice",
-        "payment",
-        "refund",
-        "charged",
-        "subscription",
-    ],
-    "authentication": [
-        "login",
-        "password",
-        "authentication",
-        "2fa",
-        "otp",
-        "verification",
-    ],
-    "events": [
-        "event",
-        "registration",
-        "webinar",
-        "leaderboard",
-    ],
-    "assessments": [
-        "assessment",
-        "challenge",
-        "coding test",
-        "submission",
-    ],
-    "cards": [
-        "card",
-        "visa card",
-        "credit card",
-        "debit card",
-    ],
-    "payments": [
-        "transaction",
-        "payment",
-        "checkout",
-        "declined",
-    ],
-    "account_access": [
-        "account",
-        "locked",
-        "access",
-        "disabled",
-    ],
-    "onboarding": [
-        "setup",
-        "getting started",
-        "onboarding",
-    ],
+    "billing": {
+        "billing": 5,
+        "invoice": 4,
+        "refund": 4,
+        "subscription": 4,
+    },
+    "authentication": {
+        "login": 5,
+        "password": 5,
+        "otp": 4,
+        "2fa": 4,
+    },
+    "assessments": {
+        "assessment": 5,
+        "challenge": 4,
+        "coding test": 5,
+    },
+    "payments": {
+        "payment": 5,
+        "transaction": 4,
+        "declined": 3,
+    },
+    "cards": {
+        "card": 5,
+        "credit card": 5,
+        "debit card": 5,
+    },
+    "api": {
+        "api": 5,
+        "sdk": 4,
+        "endpoint": 4,
+    },
 }
 
 
@@ -90,89 +65,99 @@ def normalize_text(text: Optional[str]) -> str:
     return text.strip()
 
 
-def infer_company(issue: Optional[str], subject: Optional[str] = None):
-    combined = normalize_text(f"{subject or ''} {issue or ''}")
+def infer_company(
+    issue: Optional[str],
+    subject: Optional[str] = None,
+):
+    combined = normalize_text(
+        f"{subject or ''} {issue or ''}"
+    )
 
-    company_keywords = {
-        "hackerrank": [
-            "hackerrank",
-            "coding challenge",
-            "assessment",
-            "hrx",
-        ],
-        "claude": [
-            "claude",
-            "anthropic",
-            "claude ai",
-        ],
-        "visa": [
-            "visa",
-            "visa card",
-            "credit card",
-            "debit card",
-            "payment declined",
-        ],
+    company_scores = {
+        "hackerrank": 0,
+        "claude": 0,
+        "visa": 0,
     }
 
-    matched = []
+    keyword_map = {
+        "hackerrank": {
+            "hackerrank": 5,
+            "assessment": 3,
+            "coding test": 4,
+            "challenge": 3,
+        },
+        "claude": {
+            "claude": 5,
+            "anthropic": 5,
+            "claude ai": 5,
+        },
+        "visa": {
+            "visa": 5,
+            "card": 2,
+            "payment": 3,
+            "transaction": 3,
+        },
+    }
 
-    for company, keywords in company_keywords.items():
-        if any(keyword in combined for keyword in keywords):
-            matched.append(company)
+    for company, keywords in keyword_map.items():
+        for keyword, weight in keywords.items():
+            if keyword in combined:
+                company_scores[company] += weight
 
-    if len(matched) == 1:
-        return matched[0]
+    ranked = sorted(
+        company_scores.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
 
-    return None
+    top_company, top_score = ranked[0]
+
+    if top_score <= 0:
+        return None
+
+    if len(ranked) > 1:
+        second_score = ranked[1][1]
+
+        if abs(top_score - second_score) <= 1:
+            return None
+
+    return top_company
 
 
 def classify_request_type(
     issue: Optional[str],
     subject: Optional[str] = None,
 ) -> str:
-    combined = normalize_text(f"{subject or ''} {issue or ''}")
+    combined = normalize_text(
+        f"{subject or ''} {issue or ''}"
+    )
 
     if not combined:
         return "invalid"
 
-    feature_keywords = {
-        "feature request",
-        "please add",
-        "would like",
-        "new feature",
-        "feature suggestion",
-    }
-
-    bug_keywords = {
-        "bug",
-        "broken",
-        "not working",
-        "error",
-        "crash",
-        "fails",
-        "failure",
-    }
-
-    product_keywords = {
-        "how do i",
-        "unable",
-        "issue",
-        "problem",
-        "support",
-        "help",
-        "question",
-    }
-
-    if any(keyword in combined for keyword in feature_keywords):
+    if any(
+        phrase in combined
+        for phrase in {
+            "feature request",
+            "please add",
+            "new feature",
+        }
+    ):
         return "feature_request"
 
-    if any(keyword in combined for keyword in bug_keywords):
+    if any(
+        phrase in combined
+        for phrase in {
+            "bug",
+            "broken",
+            "crash",
+            "error",
+            "fails",
+        }
+    ):
         return "bug"
 
-    if any(keyword in combined for keyword in product_keywords):
-        return "product_issue"
-
-    return "invalid"
+    return "product_issue"
 
 
 def infer_product_area(
@@ -180,33 +165,53 @@ def infer_product_area(
     subject: Optional[str] = None,
     retrieval_results: Optional[Dict] = None,
 ) -> str:
-    combined = normalize_text(f"{subject or ''} {issue or ''}")
+    combined = normalize_text(
+        f"{subject or ''} {issue or ''}"
+    )
+
+    scores = {}
 
     for area, keywords in PRODUCT_AREA_KEYWORDS.items():
-        if any(keyword in combined for keyword in keywords):
-            return area
+        score = 0
+
+        for keyword, weight in keywords.items():
+            if keyword in combined:
+                score += weight
+
+        if score > 0:
+            scores[area] = score
 
     if retrieval_results:
-        results = retrieval_results.get("results", [])
+        for result in retrieval_results.get(
+            "results",
+            [],
+        ):
+            area = result.get("product_area")
 
-        if results:
-            top_result = results[0]
+            if area:
+                scores[area] = scores.get(area, 0) + 2
 
-            retrieval_area = top_result.get("product_area")
+    if not scores:
+        return "general"
 
-            if retrieval_area:
-                return retrieval_area
-
-    return "general"
+    return max(
+        scores.items(),
+        key=lambda x: x[1],
+    )[0]
 
 
 def contains_sensitive_content(
     issue: Optional[str],
     subject: Optional[str] = None,
 ) -> bool:
-    combined = normalize_text(f"{subject or ''} {issue or ''}")
+    combined = normalize_text(
+        f"{subject or ''} {issue or ''}"
+    )
 
-    return any(keyword in combined for keyword in SENSITIVE_KEYWORDS)
+    return any(
+        keyword in combined
+        for keyword in SENSITIVE_KEYWORDS
+    )
 
 
 def should_escalate(
@@ -221,14 +226,15 @@ def should_escalate(
     if company not in SUPPORTED_COMPANIES:
         return True
 
-    confidence = retrieval_results.get("confidence", "low")
+    confidence = retrieval_results.get(
+        "confidence",
+        "low",
+    )
 
     if confidence == "low":
         return True
 
-    results = retrieval_results.get("results", [])
-
-    if not results:
+    if not retrieval_results.get("results"):
         return True
 
     return False
@@ -239,41 +245,34 @@ def build_justification(
     retrieval_results: Dict,
     company: Optional[str],
 ) -> str:
-    if status == "escalated":
-        confidence = retrieval_results.get("confidence", "low")
+    confidence = retrieval_results.get(
+        "confidence",
+        "low",
+    )
 
+    if status == "escalated":
         if company not in SUPPORTED_COMPANIES:
             return (
-                "Escalated because company could not be "
-                "confidently inferred."
+                "Escalated due to unsupported or "
+                "unclear company inference."
             )
 
-        if confidence == "low":
-            return (
-                "Escalated due to weak retrieval confidence "
-                "or insufficient support evidence."
-            )
+        return (
+            "Escalated due to insufficient "
+            f"retrieval confidence ({confidence})."
+        )
 
-        return "Escalated due to sensitive or high-risk content."
+    top = retrieval_results["results"][0]
 
-    results = retrieval_results.get("results", [])
-
-    if not results:
-        return "Replied using limited grounded support documentation."
-
-    source = results[0].get("source_path", "support corpus")
-
-    return f"Replied using grounded retrieval evidence from {source}."
+    return (
+        "Replied using grounded retrieval evidence "
+        f"from {top['source_path']} "
+        f"with {confidence} confidence."
+    )
 
 
 def generate_fallback_response(status: str) -> str:
-    if status == "escalated":
-        return (
-            "Your request requires additional review by a support "
-            "specialist. The issue has been escalated for further assistance."
-        )
-
     return (
-        "Based on the available support documentation, we found "
-        "guidance related to your request."
+        "Your request requires additional review "
+        "by a support specialist."
     )
